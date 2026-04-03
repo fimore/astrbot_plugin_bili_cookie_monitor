@@ -1,19 +1,20 @@
 """B站Cookie状态监控插件"""
-import os, json, asyncio
+import os
+import json
+import asyncio
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, Set, List
+from pathlib import Path
+
 import aiohttp
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.2", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.3", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
-    
-    # 管理员用户ID白名单
-    ADMIN_WHITELIST = ["2AF398285F94FD618716FEA1159F83B7"]
-    
+
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         # 安全处理config类型
@@ -26,14 +27,27 @@ class BiliCookieMonitorPlugin(Star):
                 self.config = dict(config)
             except (TypeError, ValueError):
                 self.config = {}
-        
-        # 配置参数 - 校验check_interval
+
+        # 配置参数 - 校验check_interval（安全处理类型转换）
         self.cookie: str = self.config.get("cookie", "")
-        raw_interval = self.config.get("check_interval", 3600)
-        self.check_interval: int = max(60, int(raw_interval) if raw_interval else 3600)
+        self.check_interval: int = self._parse_check_interval(
+            self.config.get("check_interval", 3600)
+        )
         self.cookie_file: str = self.config.get("cookie_file", "")
         self.notify_user_id: str = self.config.get("notify_user_id", "")
-        
+
+        # 管理员白名单（必须从配置文件读取）
+        admin_whitelist = self.config.get("admin_whitelist", [])
+        if not admin_whitelist:
+            logger.warning("未配置admin_whitelist，/bili_update指令将无法使用")
+        self.ADMIN_WHITELIST: Set[str] = set(admin_whitelist) if isinstance(admin_whitelist, list) else {admin_whitelist}
+
+        # 通知冷却时间（可配置）
+        self._notify_cooldown: int = max(60, int(self.config.get("notify_cooldown", 3600) or 3600))
+
+        # 允许的Cookie文件读取目录（安全限制）
+        self._allowed_cookie_dirs: List[str] = self.config.get("allowed_cookie_dirs", [])
+
         # 状态记录
         self.last_status: Optional[Dict] = None
         self.last_check_time: Optional[datetime] = None
@@ -41,14 +55,23 @@ class BiliCookieMonitorPlugin(Star):
         self._task: Optional[asyncio.Task] = None
         self._was_invalid: bool = False
         self._last_notify_time: Optional[datetime] = None
-        self._notify_cooldown: int = 3600  # 通知冷却时间（秒）
-        
+
         # 并发锁
         self._file_lock = asyncio.Lock()
-        
+        self._cookie_lock = asyncio.Lock()
+
         # 数据目录
         self._data_dir = StarTools.get_data_dir("astrbot_plugin_bili_cookie_monitor")
         self._status_file = self._data_dir / "last_status.json"
+
+    @staticmethod
+    def _parse_check_interval(value) -> int:
+        """安全解析检测间隔，返回默认值如果解析失败"""
+        try:
+            interval = int(value)
+            return max(60, interval)  # 最小60秒
+        except (ValueError, TypeError):
+            return 3600  # 默认1小时
     
     async def initialize(self):
         """插件初始化"""
@@ -99,31 +122,84 @@ class BiliCookieMonitorPlugin(Star):
         if sender_id not in self.ADMIN_WHITELIST:
             yield event.plain_result("❌ 权限不足，仅管理员可使用此指令")
             return
-        
+
         # 获取参数
         msg = event.message_str.strip()
         parts = msg.split(maxsplit=1)
-        
+
         if len(parts) < 2:
             yield event.plain_result("用法: /bili_update <cookie文件路径>")
             return
-        
+
         new_path = parts[1].strip()
-        
-        # 文件存在性检查
-        if not os.path.exists(new_path):
-            yield event.plain_result(f"❌ 文件不存在: {new_path}")
+
+        # 路径安全验证
+        error_msg = self._validate_cookie_path(new_path)
+        if error_msg:
+            yield event.plain_result(error_msg)
             return
-        
-        # 安全检查：只允许读取Cookie相关文件
-        fname = os.path.basename(new_path).lower()
-        if "cookie" not in fname:
-            yield event.plain_result("❌ 仅允许读取cookie相关文件")
+
+        # 检查文件是否存在且可读
+        if not await self._is_readable_file(new_path):
+            yield event.plain_result(f"❌ 文件不存在或不可读: {new_path}")
             return
-        
+
         self.cookie_file = new_path
         yield event.plain_result(f"✅ 已更新Cookie文件路径（本次运行有效）")
-        logger.info(f"Cookie文件路径已更新为: {new_path}")
+        logger.info(f"Cookie文件路径已更新为: {new_path} by {sender_id}")
+
+    def _validate_cookie_path(self, file_path: str) -> Optional[str]:
+        """
+        验证Cookie文件路径是否安全
+        返回错误信息，None表示验证通过
+        """
+        try:
+            path = Path(file_path).resolve()
+            fname = path.name.lower()
+            normalized_path = str(path).lower()  # 提前定义，供后续检查使用
+
+            # 1. 文件名必须包含cookie（防御性命名约定）
+            if "cookie" not in fname:
+                return "❌ 仅允许读取cookie相关文件（文件名需包含'cookie'）"
+
+            # 2. 检查文件扩展名
+            allowed_extensions = {".txt", ".json", ".cookie", ""}
+            if path.suffix.lower() not in allowed_extensions:
+                return f"❌ 不支持的文件类型，仅允许: {', '.join(allowed_extensions)}"
+
+            # 3. 如果配置了允许目录，检查路径是否在允许范围内
+            if self._allowed_cookie_dirs:
+                allowed = False
+                for allowed_dir in self._allowed_cookie_dirs:
+                    allowed_path = Path(allowed_dir).resolve()
+                    try:
+                        path.relative_to(allowed_path)
+                        allowed = True
+                        break
+                    except ValueError:
+                        continue
+                if not allowed:
+                    return "❌ 文件路径不在允许的目录范围内"
+
+            # 4. 拒绝敏感路径
+            sensitive_patterns = ["passwd", "shadow", "hosts", "system32", "windows/system"]
+            for pattern in sensitive_patterns:
+                if pattern in normalized_path:
+                    return f"❌ 拒绝访问敏感路径"
+
+            return None
+
+        except (OSError, ValueError) as e:
+            return f"❌ 路径验证失败: {e}"
+
+    async def _is_readable_file(self, file_path: str) -> bool:
+        """异步检查文件是否可读"""
+        try:
+            path = Path(file_path)
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: path.is_file() and os.access(path, os.R_OK))
+        except (OSError, ValueError):
+            return False
     
     # ==================== 监控逻辑 ====================
     
@@ -131,17 +207,15 @@ class BiliCookieMonitorPlugin(Star):
         """监控循环"""
         while self._running:
             try:
-                # 从文件读取Cookie
-                if self.cookie_file and os.path.exists(self.cookie_file):
-                    with open(self.cookie_file, "r", encoding="utf-8") as f:
-                        self.cookie = f.read().strip()
-                
+                # 从文件读取Cookie（异步加锁）
+                await self._load_cookie_from_file()
+
                 # 检测Cookie状态
                 result = await self._check_cookie()
                 self.last_status = result
                 self.last_check_time = datetime.now()
                 await self._save_last_status()
-                
+
                 if result["valid"]:
                     logger.info(f"B站Cookie有效 - {result.get('username')}")
                     if self._was_invalid:
@@ -154,14 +228,40 @@ class BiliCookieMonitorPlugin(Star):
                         await self._send_notification("❌ Cookie已失效", f"错误: {result.get('error')}")
                         self._last_notify_time = datetime.now()
                     self._was_invalid = True
-                
+
             except asyncio.CancelledError:
                 logger.info("监控任务被取消")
                 raise
             except Exception as e:
                 logger.error(f"B站Cookie监控出错: {e}")
-            
+
             await asyncio.sleep(self.check_interval)
+
+    async def _load_cookie_from_file(self):
+        """异步从文件加载Cookie（带锁保护）"""
+        if not self.cookie_file:
+            return
+
+        async with self._cookie_lock:
+            try:
+                path = Path(self.cookie_file)
+                if not path.is_file():
+                    logger.debug(f"Cookie文件不存在: {self.cookie_file}")
+                    return
+
+                loop = asyncio.get_event_loop()
+                content = await loop.run_in_executor(None, self._read_file_sync, path)
+                self.cookie = content.strip()
+                logger.debug(f"已从文件加载Cookie，长度: {len(self.cookie)}")
+
+            except (IOError, OSError) as e:
+                logger.error(f"读取Cookie文件失败: {e}")
+
+    @staticmethod
+    def _read_file_sync(path: Path) -> str:
+        """同步读取文件内容（在线程池中执行）"""
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
     
     def _should_notify(self) -> bool:
         """检查是否应该发送通知（冷却机制）"""

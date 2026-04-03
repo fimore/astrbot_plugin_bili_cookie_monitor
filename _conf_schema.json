@@ -5,12 +5,12 @@
     "default": ""
   },
   "check_interval": {
-    "description": "检测间隔（秒）",
+    "description": "检测间隔（秒），最小60秒",
     "type": "int",
     "default": 3600
   },
   "cookie_file": {
-    "description": "Cookie文件路径",
+    "description": "Cookie文件路径（文件名需包含'cookie'）",
     "type": "string",
     "default": ""
   },
@@ -18,5 +18,20 @@
     "description": "通知用户ID",
     "type": "string",
     "default": ""
+  },
+  "admin_whitelist": {
+    "description": "管理员用户ID白名单（数组）",
+    "type": "array",
+    "default": []
+  },
+  "notify_cooldown": {
+    "description": "通知冷却时间（秒），最小60秒",
+    "type": "int",
+    "default": 3600
+  },
+  "allowed_cookie_dirs": {
+    "description": "允许读取Cookie文件的目录列表（留空则不做限制）",
+    "type": "array",
+    "default": []
   }
 }

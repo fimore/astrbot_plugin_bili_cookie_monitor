@@ -20,8 +20,8 @@
     "default": ""
   },
   "admin_whitelist": {
-    "description": "管理员用户ID白名单（数组）",
-    "type": "array",
+    "description": "管理员用户ID白名单（列表）",
+    "type": "list",
     "default": []
   },
   "notify_cooldown": {
@@ -31,7 +31,7 @@
   },
   "allowed_cookie_dirs": {
     "description": "允许读取Cookie文件的目录列表（留空则只允许插件数据目录内的文件）",
-    "type": "array",
+    "type": "list",
     "default": []
   }
 }

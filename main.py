@@ -11,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.7", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.8", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 
@@ -36,11 +36,15 @@ class BiliCookieMonitorPlugin(Star):
         self.cookie_file: str = self.config.get("cookie_file", "")
         self.notify_user_id: str = self.config.get("notify_user_id", "")
 
-        # 管理员白名单（必须从配置文件读取）
+        # 管理员白名单（必须从配置文件读取，强制转换为字符串）
         admin_whitelist = self.config.get("admin_whitelist", [])
         if not admin_whitelist:
             logger.warning("未配置admin_whitelist，/bili_update指令将无法使用")
-        self.ADMIN_WHITELIST: Set[str] = set(admin_whitelist) if isinstance(admin_whitelist, list) else {admin_whitelist}
+        # 确保所有元素都是字符串，避免类型不匹配导致权限检查失败
+        if isinstance(admin_whitelist, list):
+            self.ADMIN_WHITELIST: Set[str] = {str(x) for x in admin_whitelist}
+        else:
+            self.ADMIN_WHITELIST = {str(admin_whitelist)}
 
         # 通知冷却时间（可配置）
         self._notify_cooldown: int = max(60, int(self.config.get("notify_cooldown", 3600) or 3600))
@@ -164,9 +168,20 @@ class BiliCookieMonitorPlugin(Star):
             return
 
         self.cookie_file = new_path
+
+        # 如果监控未运行，尝试启动
+        was_not_running = not self._running
+        if was_not_running:
+            if not self._http_session:
+                self._http_session = aiohttp.ClientSession()
+            self._running = True
+            self._task = asyncio.create_task(self._monitor_loop())
+            logger.info("Cookie文件已更新，启动监控循环")
+
         yield event.plain_result(
             f"✅ Cookie文件路径已更新（本次运行有效）\n"
             f"路径: {new_path}\n"
+            f"{'🚀 监控已启动' if was_not_running else '📊 监控运行中'}\n"
             f"⚠️ 重启后将失效，请在配置文件中永久设置 cookie_file 项"
         )
         logger.info(f"Cookie文件路径已更新为: {new_path} by {sender_id}")
@@ -257,14 +272,15 @@ class BiliCookieMonitorPlugin(Star):
                         self._last_notify_time = datetime.now()
                     self._was_invalid = True
 
-                # 等待下一次检测
-                await asyncio.sleep(self.check_interval)
-
             except asyncio.CancelledError:
                 logger.info("监控任务被取消")
                 break
             except Exception:
                 logger.exception("B站Cookie监控出错")
+            finally:
+                # 无论成功或异常，都等待下一次检测
+                if self._running:
+                    await asyncio.sleep(self.check_interval)
 
     async def _load_cookie_from_file(self):
         """从文件加载Cookie（优先级高于配置中的cookie）"""

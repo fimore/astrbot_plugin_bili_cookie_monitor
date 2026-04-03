@@ -11,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.5", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.6", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 
@@ -60,6 +60,9 @@ class BiliCookieMonitorPlugin(Star):
         self._file_lock = asyncio.Lock()
         self._cookie_lock = asyncio.Lock()
 
+        # HTTP会话（复用连接池）
+        self._http_session: Optional[aiohttp.ClientSession] = None
+
         # 数据目录
         self._data_dir = StarTools.get_data_dir("astrbot_plugin_bili_cookie_monitor")
         self._status_file = self._data_dir / "last_status.json"
@@ -77,6 +80,9 @@ class BiliCookieMonitorPlugin(Star):
         """插件初始化"""
         await self._load_last_status()
 
+        # 创建HTTP会话（复用连接池）
+        self._http_session = aiohttp.ClientSession()
+
         # 检查Cookie配置
         has_cookie = bool(self.cookie)
         has_cookie_file = bool(self.cookie_file)
@@ -85,6 +91,9 @@ class BiliCookieMonitorPlugin(Star):
             logger.warning("同时配置了 cookie 和 cookie_file，将优先使用 cookie_file 中的内容")
         elif not has_cookie and not has_cookie_file:
             logger.warning("B站Cookie监控插件: 未配置Cookie或Cookie文件")
+            # 关闭已创建的会话
+            await self._http_session.close()
+            self._http_session = None
             return
 
         self._running = True
@@ -289,40 +298,42 @@ class BiliCookieMonitorPlugin(Star):
         """检测B站Cookie是否有效"""
         if not self.cookie:
             return {"valid": False, "error": "Cookie为空"}
-        
+
+        if not self._http_session:
+            return {"valid": False, "error": "HTTP会话未初始化"}
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Cookie": self.cookie,
             "Referer": "https://www.bilibili.com/"
         }
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://api.bilibili.com/x/web-interface/nav",
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    data = await resp.json()
-                    
-                    if data.get("code") == 0 and data.get("data", {}).get("isLogin"):
-                        u = data["data"]
-                        return {
-                            "valid": True,
-                            "username": u.get("uname", ""),
-                            "uid": u.get("mid", 0),
-                            "vip": u.get("vipStatus") == 1
-                        }
-                    
-                    error_msg = data.get("message", "未知错误")
-                    code = data.get("code")
-                    if code == -101:
-                        error_msg = "账号未登录或Cookie已过期"
-                    elif code == -352:
-                        error_msg = "请求被风控"
-                    
-                    return {"valid": False, "error": error_msg, "code": code}
-                    
+            async with self._http_session.get(
+                "https://api.bilibili.com/x/web-interface/nav",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                data = await resp.json()
+
+                if data.get("code") == 0 and data.get("data", {}).get("isLogin"):
+                    u = data["data"]
+                    return {
+                        "valid": True,
+                        "username": u.get("uname", ""),
+                        "uid": u.get("mid", 0),
+                        "vip": u.get("vipStatus") == 1
+                    }
+
+                error_msg = data.get("message", "未知错误")
+                code = data.get("code")
+                if code == -101:
+                    error_msg = "账号未登录或Cookie已过期"
+                elif code == -352:
+                    error_msg = "请求被风控"
+
+                return {"valid": False, "error": error_msg, "code": code}
+
         except asyncio.TimeoutError:
             return {"valid": False, "error": "请求超时"}
         except aiohttp.ClientError as e:
@@ -390,4 +401,10 @@ class BiliCookieMonitorPlugin(Star):
             except Exception:
                 # 捕获其他可能的异常，避免传播
                 logger.exception("终止监控任务时发生异常")
+
+        # 关闭HTTP会话
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+            logger.debug("HTTP会话已关闭")
+
         logger.info("B站Cookie监控插件已停止")

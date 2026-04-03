@@ -13,8 +13,8 @@ AstrBot插件 - 定时检测B站Cookie有效性，失效时主动通知用户
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `cookie` | string | "" | B站Cookie字符串（二选一） |
-| `cookie_file` | string | "" | Cookie文件路径（文件名需包含'cookie'） |
+| `cookie` | string | "" | B站Cookie字符串（二选一，`cookie_file`优先级更高） |
+| `cookie_file` | string | "" | Cookie文件路径（优先级高于`cookie`） |
 | `check_interval` | int | 3600 | 检测间隔（秒），最小60秒 |
 | `notify_user_id` | string | "" | 接收通知的用户ID |
 | `admin_whitelist` | array | [] | 管理员用户ID白名单，用于 `/bili_update` 指令 |

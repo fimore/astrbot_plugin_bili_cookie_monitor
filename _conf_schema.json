@@ -1,6 +1,6 @@
 {
   "cookie": {
-    "description": "B站Cookie字符串",
+    "description": "B站Cookie字符串（与cookie_file二选一，cookie_file优先级更高）",
     "type": "string",
     "default": ""
   },
@@ -10,7 +10,7 @@
     "default": 3600
   },
   "cookie_file": {
-    "description": "Cookie文件路径（文件名需包含'cookie'）",
+    "description": "Cookie文件路径（优先级高于cookie，文件名需包含'cookie'）",
     "type": "string",
     "default": ""
   },

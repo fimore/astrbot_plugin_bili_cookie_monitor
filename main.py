@@ -11,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.4", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.5", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 
@@ -76,12 +76,22 @@ class BiliCookieMonitorPlugin(Star):
     async def initialize(self):
         """插件初始化"""
         await self._load_last_status()
-        if self.cookie or self.cookie_file:
-            self._running = True
-            self._task = asyncio.create_task(self._monitor_loop())
-            logger.info(f"B站Cookie监控插件已启动，检测间隔: {self.check_interval}秒")
-        else:
+
+        # 检查Cookie配置
+        has_cookie = bool(self.cookie)
+        has_cookie_file = bool(self.cookie_file)
+
+        if has_cookie and has_cookie_file:
+            logger.warning("同时配置了 cookie 和 cookie_file，将优先使用 cookie_file 中的内容")
+        elif not has_cookie and not has_cookie_file:
             logger.warning("B站Cookie监控插件: 未配置Cookie或Cookie文件")
+            return
+
+        self._running = True
+        self._task = asyncio.create_task(self._monitor_loop())
+
+        source = "cookie_file" if has_cookie_file else "cookie"
+        logger.info(f"B站Cookie监控插件已启动，数据源: {source}，检测间隔: {self.check_interval}秒")
     
     # ==================== 指令处理 ====================
     
@@ -243,7 +253,7 @@ class BiliCookieMonitorPlugin(Star):
                 logger.exception("B站Cookie监控出错")
 
     async def _load_cookie_from_file(self):
-        """异步从文件加载Cookie（带锁保护）"""
+        """从文件加载Cookie（优先级高于配置中的cookie）"""
         if not self.cookie_file:
             return
 
@@ -251,7 +261,7 @@ class BiliCookieMonitorPlugin(Star):
             try:
                 path = Path(self.cookie_file)
                 if not path.is_file():
-                    logger.debug(f"Cookie文件不存在: {self.cookie_file}")
+                    logger.warning(f"Cookie文件不存在: {self.cookie_file}")
                     return
 
                 loop = asyncio.get_running_loop()

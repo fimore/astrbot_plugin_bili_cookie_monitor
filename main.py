@@ -11,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.6", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.7", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 
@@ -185,27 +185,32 @@ class BiliCookieMonitorPlugin(Star):
             if "cookie" not in fname:
                 return "❌ 仅允许读取cookie相关文件（文件名需包含'cookie'）"
 
-            # 2. 检查文件扩展名
-            allowed_extensions = {".txt", ".json", ".cookie", ""}
+            # 2. 检查文件扩展名（移除空后缀，要求必须有扩展名）
+            allowed_extensions = {".txt", ".json", ".cookie"}
             if path.suffix.lower() not in allowed_extensions:
                 return f"❌ 不支持的文件类型，仅允许: {', '.join(allowed_extensions)}"
 
-            # 3. 如果配置了允许目录，检查路径是否在允许范围内
-            if self._allowed_cookie_dirs:
-                allowed = False
-                for allowed_dir in self._allowed_cookie_dirs:
-                    allowed_path = Path(allowed_dir).resolve()
-                    try:
-                        path.relative_to(allowed_path)
-                        allowed = True
-                        break
-                    except ValueError:
-                        continue
-                if not allowed:
-                    return "❌ 文件路径不在允许的目录范围内"
+            # 3. 目录范围检查
+            # 确定允许的目录列表：如果未配置，默认只允许插件数据目录
+            allowed_dirs = self._allowed_cookie_dirs if self._allowed_cookie_dirs else [str(self._data_dir)]
 
-            # 4. 拒绝敏感路径
-            sensitive_patterns = ["passwd", "shadow", "hosts", "system32", "windows/system"]
+            allowed = False
+            for allowed_dir in allowed_dirs:
+                allowed_path = Path(allowed_dir).resolve()
+                try:
+                    path.relative_to(allowed_path)
+                    allowed = True
+                    break
+                except ValueError:
+                    continue
+            if not allowed:
+                if self._allowed_cookie_dirs:
+                    return f"❌ 文件路径不在配置的允许目录范围内"
+                else:
+                    return f"❌ 文件路径必须在插件数据目录内 ({self._data_dir})，或配置 allowed_cookie_dirs"
+
+            # 4. 拒绝敏感路径（双重保险）
+            sensitive_patterns = ["passwd", "shadow", "hosts", "system32", "windows/system", "/etc/", "/sys/", "/proc/"]
             for pattern in sensitive_patterns:
                 if pattern in normalized_path:
                     return f"❌ 拒绝访问敏感路径"

@@ -11,7 +11,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.3", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.4", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 
@@ -145,7 +145,11 @@ class BiliCookieMonitorPlugin(Star):
             return
 
         self.cookie_file = new_path
-        yield event.plain_result(f"✅ 已更新Cookie文件路径（本次运行有效）")
+        yield event.plain_result(
+            f"✅ Cookie文件路径已更新（本次运行有效）\n"
+            f"路径: {new_path}\n"
+            f"⚠️ 重启后将失效，请在配置文件中永久设置 cookie_file 项"
+        )
         logger.info(f"Cookie文件路径已更新为: {new_path} by {sender_id}")
 
     def _validate_cookie_path(self, file_path: str) -> Optional[str]:
@@ -196,7 +200,7 @@ class BiliCookieMonitorPlugin(Star):
         """异步检查文件是否可读"""
         try:
             path = Path(file_path)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, lambda: path.is_file() and os.access(path, os.R_OK))
         except (OSError, ValueError):
             return False
@@ -229,13 +233,14 @@ class BiliCookieMonitorPlugin(Star):
                         self._last_notify_time = datetime.now()
                     self._was_invalid = True
 
+                # 等待下一次检测
+                await asyncio.sleep(self.check_interval)
+
             except asyncio.CancelledError:
                 logger.info("监控任务被取消")
-                raise
-            except Exception as e:
-                logger.error(f"B站Cookie监控出错: {e}")
-
-            await asyncio.sleep(self.check_interval)
+                break
+            except Exception:
+                logger.exception("B站Cookie监控出错")
 
     async def _load_cookie_from_file(self):
         """异步从文件加载Cookie（带锁保护）"""
@@ -249,7 +254,7 @@ class BiliCookieMonitorPlugin(Star):
                     logger.debug(f"Cookie文件不存在: {self.cookie_file}")
                     return
 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 content = await loop.run_in_executor(None, self._read_file_sync, path)
                 self.cookie = content.strip()
                 logger.debug(f"已从文件加载Cookie，长度: {len(self.cookie)}")
@@ -370,5 +375,9 @@ class BiliCookieMonitorPlugin(Star):
             try:
                 await self._task
             except asyncio.CancelledError:
+                # 任务被取消，正常退出
                 pass
+            except Exception:
+                # 捕获其他可能的异常，避免传播
+                logger.exception("终止监控任务时发生异常")
         logger.info("B站Cookie监控插件已停止")

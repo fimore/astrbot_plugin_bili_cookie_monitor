@@ -1,0 +1,22 @@
+{
+  "cookie": {
+    "description": "B站Cookie字符串",
+    "type": "string",
+    "default": ""
+  },
+  "check_interval": {
+    "description": "检测间隔（秒）",
+    "type": "int",
+    "default": 3600
+  },
+  "cookie_file": {
+    "description": "Cookie文件路径",
+    "type": "string",
+    "default": ""
+  },
+  "notify_user_id": {
+    "description": "通知用户ID",
+    "type": "string",
+    "default": ""
+  }
+}

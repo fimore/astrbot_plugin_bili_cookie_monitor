@@ -1,0 +1,5 @@
+name: "astrbot_plugin_bili_cookie_monitor"  
+desc: "B站Cookie状态监控插件 - 定时检测Cookie有效性，失效时主动通知用户"  
+version: "2.0.1"  
+author: "Ayaka"  
+display_name: "B站Cookie监控" 

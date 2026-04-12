@@ -1,17 +1,35 @@
-"""B站Cookie状态监控插件"""
+"""B站Cookie状态监控插件 - 增强版（支持扫码登录）"""
 import os
 import json
 import asyncio
 from datetime import datetime
-from typing import Optional, Dict, Set, List
+from typing import Optional, Dict
 from pathlib import Path
 
 import aiohttp
+import qrcode
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件", "2.0.8", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+# B站扫码登录 API
+BILI_QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+BILI_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+
+# 扫码状态码
+QR_CODE_UNSCANNED = 86101  # 未扫码
+QR_CODE_SCANNED = 86090    # 已扫码未确认
+QR_CODE_EXPIRED = 86038    # 二维码已过期
+QR_CODE_SUCCESS = 0        # 登录成功
+
+# 二维码有效期（秒）
+QR_CODE_EXPIRE_TIME = 180
+
+# 轮询间隔（秒）
+POLL_INTERVAL = 5
+
+
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件(扫码登录增强版)", "3.0.0", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 
@@ -33,24 +51,10 @@ class BiliCookieMonitorPlugin(Star):
         self.check_interval: int = self._parse_check_interval(
             self.config.get("check_interval", 3600)
         )
-        self.cookie_file: str = self.config.get("cookie_file", "")
         self.notify_user_id: str = self.config.get("notify_user_id", "")
-
-        # 管理员白名单（必须从配置文件读取，强制转换为字符串）
-        admin_whitelist = self.config.get("admin_whitelist", [])
-        if not admin_whitelist:
-            logger.warning("未配置admin_whitelist，/bili_update指令将无法使用")
-        # 确保所有元素都是字符串，避免类型不匹配导致权限检查失败
-        if isinstance(admin_whitelist, list):
-            self.ADMIN_WHITELIST: Set[str] = {str(x) for x in admin_whitelist}
-        else:
-            self.ADMIN_WHITELIST = {str(admin_whitelist)}
 
         # 通知冷却时间（可配置）
         self._notify_cooldown: int = max(60, int(self.config.get("notify_cooldown", 3600) or 3600))
-
-        # 允许的Cookie文件读取目录（安全限制）
-        self._allowed_cookie_dirs: List[str] = self.config.get("allowed_cookie_dirs", [])
 
         # 状态记录
         self.last_status: Optional[Dict] = None
@@ -71,40 +75,33 @@ class BiliCookieMonitorPlugin(Star):
         self._data_dir = StarTools.get_data_dir("astrbot_plugin_bili_cookie_monitor")
         self._status_file = self._data_dir / "last_status.json"
 
+        # 扫码登录状态：记录当前正在扫码的用户，防止重复扫码
+        self._login_tasks: Dict[str, asyncio.Task] = {}
+
     @staticmethod
     def _parse_check_interval(value) -> int:
         """安全解析检测间隔，返回默认值如果解析失败"""
         try:
             interval = int(value)
-            return max(60, interval)  # 最小60秒
+            return max(60, interval)
         except (ValueError, TypeError):
-            return 3600  # 默认1小时
+            return 3600
     
     async def initialize(self):
         """插件初始化"""
         await self._load_last_status()
-
-        # 创建HTTP会话（复用连接池）
+        await self._load_cookie_from_data()
         self._http_session = aiohttp.ClientSession()
 
-        # 检查Cookie配置
-        has_cookie = bool(self.cookie)
-        has_cookie_file = bool(self.cookie_file)
-
-        if has_cookie and has_cookie_file:
-            logger.warning("同时配置了 cookie 和 cookie_file，将优先使用 cookie_file 中的内容")
-        elif not has_cookie and not has_cookie_file:
-            logger.warning("B站Cookie监控插件: 未配置Cookie或Cookie文件")
-            # 关闭已创建的会话
+        if not self.cookie:
+            logger.info("B站Cookie监控插件: 未配置Cookie，请使用 /bili_login 扫码登录获取")
             await self._http_session.close()
             self._http_session = None
             return
 
         self._running = True
         self._task = asyncio.create_task(self._monitor_loop())
-
-        source = "cookie_file" if has_cookie_file else "cookie"
-        logger.info(f"B站Cookie监控插件已启动，数据源: {source}，检测间隔: {self.check_interval}秒")
+        logger.info(f"B站Cookie监控插件已启动，检测间隔: {self.check_interval}秒")
     
     # ==================== 指令处理 ====================
     
@@ -129,7 +126,6 @@ class BiliCookieMonitorPlugin(Star):
         """查看B站Cookie监控状态"""
         lines = [
             f"检测间隔: {self.check_interval}秒",
-            f"Cookie文件: {self.cookie_file or '未配置'}",
             f"监控状态: {'运行中' if self._running else '已停止'}",
         ]
         if self.last_status:
@@ -137,123 +133,246 @@ class BiliCookieMonitorPlugin(Star):
             lines.append(f"上次状态: {status}")
         yield event.plain_result("\n".join(lines))
     
-    @filter.command("bili_update")
-    async def cmd_update(self, event: AstrMessageEvent):
-        """更新Cookie文件路径（仅管理员）"""
-        # 权限校验
+    @filter.command("bili_login")
+    async def cmd_qr_login(self, event: AstrMessageEvent):
+        """B站扫码登录 - 获取二维码图片"""
         sender_id = event.get_sender_id()
-        if sender_id not in self.ADMIN_WHITELIST:
-            yield event.plain_result("❌ 权限不足，仅管理员可使用此指令")
+
+        # 检查是否有正在进行的登录
+        if sender_id in self._login_tasks and not self._login_tasks[sender_id].done():
+            yield event.plain_result("⏳ 你有一个正在进行的扫码登录，请先完成或等待超时")
             return
 
-        # 获取参数
-        msg = event.message_str.strip()
-        parts = msg.split(maxsplit=1)
-
-        if len(parts) < 2:
-            yield event.plain_result("用法: /bili_update <cookie文件路径>")
-            return
-
-        new_path = parts[1].strip()
-
-        # 路径安全验证
-        error_msg = self._validate_cookie_path(new_path)
-        if error_msg:
-            yield event.plain_result(error_msg)
-            return
-
-        # 检查文件是否存在且可读
-        if not await self._is_readable_file(new_path):
-            yield event.plain_result(f"❌ 文件不存在或不可读: {new_path}")
-            return
-
-        self.cookie_file = new_path
-
-        # 如果监控未运行，尝试启动
-        was_not_running = not self._running
-        if was_not_running:
+        try:
             if not self._http_session:
                 self._http_session = aiohttp.ClientSession()
-            self._running = True
-            self._task = asyncio.create_task(self._monitor_loop())
-            logger.info("Cookie文件已更新，启动监控循环")
 
-        yield event.plain_result(
-            f"✅ Cookie文件路径已更新（本次运行有效）\n"
-            f"路径: {new_path}\n"
-            f"{'🚀 监控已启动' if was_not_running else '📊 监控运行中'}\n"
-            f"⚠️ 重启后将失效，请在配置文件中永久设置 cookie_file 项"
-        )
-        logger.info(f"Cookie文件路径已更新为: {new_path} by {sender_id}")
+            # 1. 调用B站API获取二维码
+            yield event.plain_result("🔄 正在生成B站登录二维码...")
 
-    def _validate_cookie_path(self, file_path: str) -> Optional[str]:
-        """
-        验证Cookie文件路径是否安全
-        返回错误信息，None表示验证通过
-        """
+            async with self._http_session.get(
+                BILI_QR_GENERATE_URL,
+                headers=self._get_bili_headers(),
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                data = await resp.json()
+
+            if data.get("code") != 0:
+                yield event.plain_result(f"❌ 获取二维码失败: {data.get('message', '未知错误')}")
+                return
+
+            qrcode_url = data["data"]["url"]
+            qrcode_key = data["data"]["qrcode_key"]
+
+            if not qrcode_key:
+                yield event.plain_result("❌ 获取qrcode_key失败")
+                return
+
+            # 2. 生成二维码图片
+            qr_image = await self._generate_qrcode_image(qrcode_url)
+            if not qr_image:
+                yield event.plain_result("❌ 二维码生成失败，请检查是否已安装 qrcode 库")
+                return
+
+            # 3. 保存二维码图片并发送给用户
+            qr_path = self._data_dir / f"qrcode_{sender_id}.png"
+            os.makedirs(self._data_dir, exist_ok=True)
+            qr_image.save(str(qr_path), "PNG")
+
+            # 发送二维码图片
+            yield event.image_result(str(qr_path))
+
+            yield event.plain_result(
+                "📱 请使用 **B站App** 扫描上方二维码登录\n"
+                "⏱️ 二维码有效期约3分钟\n"
+                "📋 扫码后请在手机上点击「确认登录」"
+            )
+
+            logger.info(f"已发送B站登录二维码给用户 {sender_id}，qrcode_key: {qrcode_key[:8]}...")
+
+            # 4. 启动异步轮询任务
+            task = asyncio.create_task(
+                self._poll_qr_login(sender_id, qrcode_key, qr_path)
+            )
+            self._login_tasks[sender_id] = task
+
+        except asyncio.TimeoutError:
+            yield event.plain_result("❌ 请求超时，请稍后重试")
+        except aiohttp.ClientError as e:
+            yield event.plain_result(f"❌ 网络错误: {e}")
+        except Exception as e:
+            logger.exception("扫码登录出错")
+            yield event.plain_result(f"❌ 生成二维码失败: {e}")
+
+    async def _poll_qr_login(self, sender_id: str, qrcode_key: str, qr_path: Path):
+        """异步轮询扫码状态"""
         try:
-            path = Path(file_path).resolve()
-            fname = path.name.lower()
-            normalized_path = str(path).lower()  # 提前定义，供后续检查使用
+            start_time = datetime.now()
+            last_notified_status = None
 
-            # 1. 文件名必须包含cookie（防御性命名约定）
-            if "cookie" not in fname:
-                return "❌ 仅允许读取cookie相关文件（文件名需包含'cookie'）"
+            while True:
+                elapsed = (datetime.now() - start_time).total_seconds()
 
-            # 2. 检查文件扩展名（移除空后缀，要求必须有扩展名）
-            allowed_extensions = {".txt", ".json", ".cookie"}
-            if path.suffix.lower() not in allowed_extensions:
-                return f"❌ 不支持的文件类型，仅允许: {', '.join(allowed_extensions)}"
-
-            # 3. 目录范围检查
-            # 确定允许的目录列表：如果未配置，默认只允许插件数据目录
-            allowed_dirs = self._allowed_cookie_dirs if self._allowed_cookie_dirs else [str(self._data_dir)]
-
-            allowed = False
-            for allowed_dir in allowed_dirs:
-                allowed_path = Path(allowed_dir).resolve()
-                try:
-                    path.relative_to(allowed_path)
-                    allowed = True
+                if elapsed >= QR_CODE_EXPIRE_TIME:
+                    logger.info(f"用户 {sender_id} 的二维码已过期")
+                    await self._notify_user(sender_id, "⏱️ 二维码已过期\n请重新发送 /bili_login 获取新二维码")
                     break
-                except ValueError:
+
+                if not self._http_session or self._http_session.closed:
+                    logger.info(f"用户 {sender_id} 的扫码轮询因会话关闭而终止")
+                    break
+
+                try:
+                    async with self._http_session.get(
+                        BILI_QR_POLL_URL,
+                        params={"qrcode_key": qrcode_key},
+                        headers=self._get_bili_headers(),
+                        timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        poll_data = await resp.json()
+                        set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+                except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    logger.warning(f"轮询扫码状态失败: {e}")
+                    await asyncio.sleep(POLL_INTERVAL)
                     continue
-            if not allowed:
-                if self._allowed_cookie_dirs:
-                    return f"❌ 文件路径不在配置的允许目录范围内"
+
+                code = poll_data.get("data", {}).get("code", -1)
+
+                if code == QR_CODE_UNSCANNED:
+                    pass
+
+                elif code == QR_CODE_SCANNED:
+                    if last_notified_status != QR_CODE_SCANNED:
+                        await self._notify_user(sender_id, "✅ 已扫码\n请在手机上点击「确认登录」完成授权")
+                        last_notified_status = QR_CODE_SCANNED
+
+                elif code == QR_CODE_EXPIRED:
+                    logger.info(f"用户 {sender_id} 的二维码已被B站标记为过期")
+                    await self._notify_user(sender_id, "⏱️ 二维码已过期\n请重新发送 /bili_login 获取新二维码")
+                    break
+
+                elif code == QR_CODE_SUCCESS:
+                    logger.info(f"用户 {sender_id} 扫码登录成功")
+
+                    # 从响应头Set-Cookie中提取（比resp.cookies更完整可靠）
+                    cookie_dict = {}
+                    for header in set_cookie_headers:
+                        cookie_part = header.split(";")[0].strip()
+                        if "=" in cookie_part:
+                            name, value = cookie_part.split("=", 1)
+                            cookie_dict[name.strip()] = value.strip()
+
+                    if not cookie_dict:
+                        logger.error("扫码成功但未获取到Cookie")
+                        await self._notify_user(sender_id, "❌ 登录成功但未获取到Cookie，请重试")
+                        break
+
+                    # 转换为cookie字符串格式
+                    cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
+
+                    # 更新插件状态
+                    async with self._cookie_lock:
+                        self.cookie = cookie_str
+
+                    # 持久化到配置文件，重启后自动加载
+                    await self._save_cookie_to_config(cookie_str)
+
+                    # 如果监控未运行，启动监控
+                    if not self._running:
+                        if not self._http_session:
+                            self._http_session = aiohttp.ClientSession()
+                        self._running = True
+                        self._task = asyncio.create_task(self._monitor_loop())
+                        logger.info("扫码登录后自动启动监控循环")
+
+                    # 验证Cookie是否有效
+                    result = await self._check_cookie()
+                    self.last_status = result
+                    self.last_check_time = datetime.now()
+                    await self._save_last_status()
+
+                    if result["valid"]:
+                        await self._notify_user(
+                            sender_id,
+                            f"🎉 登录成功，Cookie已生效！\n"
+                            f"👤 用户: {result.get('username', '未知')}\n"
+                            f"🆔 UID: {result.get('uid', 0)}\n"
+                            f"{'👑 大会员' if result.get('vip') else '🐟 普通用户'}\n"
+                            f"{'🚀 监控已自动启动' if self._running else '⚠️ 监控未运行'}"
+                        )
+                        self._was_invalid = False
+                    else:
+                        await self._notify_user(
+                            sender_id,
+                            f"⚠️ Cookie已保存但验证失败: {result.get('error')}\n请检查网络或重新扫码"
+                        )
+                    break
+
                 else:
-                    return f"❌ 文件路径必须在插件数据目录内 ({self._data_dir})，或配置 allowed_cookie_dirs"
+                    logger.warning(f"未知扫码状态码: {code}, 数据: {poll_data}")
 
-            # 4. 拒绝敏感路径（双重保险）
-            sensitive_patterns = ["passwd", "shadow", "hosts", "system32", "windows/system", "/etc/", "/sys/", "/proc/"]
-            for pattern in sensitive_patterns:
-                if pattern in normalized_path:
-                    return f"❌ 拒绝访问敏感路径"
+                await asyncio.sleep(POLL_INTERVAL)
 
+        except asyncio.CancelledError:
+            logger.info(f"用户 {sender_id} 的扫码轮询被取消")
+        except Exception:
+            logger.exception(f"扫码轮询出错 (用户: {sender_id})")
+            try:
+                await self._notify_user(sender_id, "❌ 扫码登录过程出错，请重新尝试 /bili_login")
+            except Exception:
+                pass
+        finally:
+            try:
+                if sender_id in self._login_tasks:
+                    del self._login_tasks[sender_id]
+            except Exception:
+                pass
+            try:
+                if qr_path.exists():
+                    qr_path.unlink()
+            except Exception:
+                pass
+
+    async def _generate_qrcode_image(self, url: str):
+        """生成二维码图片（使用qrcode库）"""
+        try:
+            qr = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            return img
+        except Exception as e:
+            logger.error(f"生成二维码失败: {e}")
             return None
 
-        except (OSError, ValueError) as e:
-            return f"❌ 路径验证失败: {e}"
+    @staticmethod
+    def _get_bili_headers() -> dict:
+        """获取B站API请求头"""
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.bilibili.com/",
+            "Accept": "application/json, text/plain, */*",
+        }
 
-    async def _is_readable_file(self, file_path: str) -> bool:
-        """异步检查文件是否可读"""
+    async def _notify_user(self, sender_id: str, message: str):
+        """向指定用户发送消息"""
         try:
-            path = Path(file_path)
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, lambda: path.is_file() and os.access(path, os.R_OK))
-        except (OSError, ValueError):
-            return False
-    
+            umo = sender_id if ":" in sender_id else f"default:FriendMessage:{sender_id}"
+            await self.context.send_message(umo, MessageChain().message(message))
+        except Exception as e:
+            logger.error(f"发送消息给 {sender_id} 失败: {e}")
+
     # ==================== 监控逻辑 ====================
     
     async def _monitor_loop(self):
         """监控循环"""
         while self._running:
             try:
-                # 从文件读取Cookie（异步加锁）
-                await self._load_cookie_from_file()
-
-                # 检测Cookie状态
                 result = await self._check_cookie()
                 self.last_status = result
                 self.last_check_time = datetime.now()
@@ -266,7 +385,6 @@ class BiliCookieMonitorPlugin(Star):
                         self._was_invalid = False
                 else:
                     logger.warning(f"B站Cookie失效: {result.get('error')}")
-                    # 状态变化时才发送通知（边沿触发 + 冷却）
                     if not self._was_invalid or self._should_notify():
                         await self._send_notification("❌ Cookie已失效", f"错误: {result.get('error')}")
                         self._last_notify_time = datetime.now()
@@ -278,36 +396,9 @@ class BiliCookieMonitorPlugin(Star):
             except Exception:
                 logger.exception("B站Cookie监控出错")
             finally:
-                # 无论成功或异常，都等待下一次检测
                 if self._running:
                     await asyncio.sleep(self.check_interval)
 
-    async def _load_cookie_from_file(self):
-        """从文件加载Cookie（优先级高于配置中的cookie）"""
-        if not self.cookie_file:
-            return
-
-        async with self._cookie_lock:
-            try:
-                path = Path(self.cookie_file)
-                if not path.is_file():
-                    logger.warning(f"Cookie文件不存在: {self.cookie_file}")
-                    return
-
-                loop = asyncio.get_running_loop()
-                content = await loop.run_in_executor(None, self._read_file_sync, path)
-                self.cookie = content.strip()
-                logger.debug(f"已从文件加载Cookie，长度: {len(self.cookie)}")
-
-            except (IOError, OSError) as e:
-                logger.error(f"读取Cookie文件失败: {e}")
-
-    @staticmethod
-    def _read_file_sync(path: Path) -> str:
-        """同步读取文件内容（在线程池中执行）"""
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    
     def _should_notify(self) -> bool:
         """检查是否应该发送通知（冷却机制）"""
         if self._last_notify_time is None:
@@ -319,7 +410,6 @@ class BiliCookieMonitorPlugin(Star):
         """检测B站Cookie是否有效"""
         if not self.cookie:
             return {"valid": False, "error": "Cookie为空"}
-
         if not self._http_session:
             return {"valid": False, "error": "HTTP会话未初始化"}
 
@@ -337,6 +427,11 @@ class BiliCookieMonitorPlugin(Star):
             ) as resp:
                 data = await resp.json()
 
+                # 自动刷新Cookie（捕获Set-Cookie）
+                set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+                if set_cookie_headers:
+                    await self._refresh_cookie_from_headers(set_cookie_headers)
+
                 if data.get("code") == 0 and data.get("data", {}).get("isLogin"):
                     u = data["data"]
                     return {
@@ -345,14 +440,12 @@ class BiliCookieMonitorPlugin(Star):
                         "uid": u.get("mid", 0),
                         "vip": u.get("vipStatus") == 1
                     }
-
                 error_msg = data.get("message", "未知错误")
                 code = data.get("code")
                 if code == -101:
                     error_msg = "账号未登录或Cookie已过期"
                 elif code == -352:
                     error_msg = "请求被风控"
-
                 return {"valid": False, "error": error_msg, "code": code}
 
         except asyncio.TimeoutError:
@@ -362,11 +455,49 @@ class BiliCookieMonitorPlugin(Star):
         except Exception as e:
             return {"valid": False, "error": f"未知错误: {e}"}
     
+    async def _refresh_cookie_from_headers(self, set_cookie_headers: list) -> bool:
+        """从响应头Set-Cookie中刷新Cookie，返回是否有更新"""
+        if not set_cookie_headers:
+            return False
+
+        new_cookies = {}
+        for header in set_cookie_headers:
+            cookie_part = header.split(";")[0].strip()
+            if "=" in cookie_part:
+                name, value = cookie_part.split("=", 1)
+                name = name.strip()
+                value = value.strip()
+                if value:
+                    new_cookies[name] = value
+
+        if not new_cookies:
+            return False
+
+        async with self._cookie_lock:
+            # 解析现有cookie
+            existing = {}
+            for part in self.cookie.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    existing[k.strip()] = v.strip()
+
+            # 合并（新cookie覆盖旧的）
+            merged = {**existing, **new_cookies}
+            new_cookie_str = "; ".join(f"{k}={v}" for k, v in merged.items())
+
+            if new_cookie_str != self.cookie:
+                self.cookie = new_cookie_str
+                await self._save_cookie_to_config(new_cookie_str)
+                logger.info(f"Cookie已自动刷新，更新了 {len(new_cookies)} 个字段")
+                return True
+
+        return False
+
     async def _send_notification(self, title: str, message: str):
         """发送通知给用户"""
         if not self.notify_user_id:
             return
-        
         try:
             umo = self.notify_user_id if ":" in self.notify_user_id else f"default:FriendMessage:{self.notify_user_id}"
             await self.context.send_message(umo, MessageChain().message(f"{title}\n{message}"))
@@ -408,22 +539,59 @@ class BiliCookieMonitorPlugin(Star):
                     json.dump(data, f, ensure_ascii=False, indent=2)
             except (IOError, OSError) as e:
                 logger.error(f"保存状态失败: {e}")
+
+    async def _load_cookie_from_data(self):
+        """从数据目录加载已保存的Cookie（优先级低于AstrBot配置）"""
+        if self.cookie:
+            return
+        try:
+            config_path = self._data_dir / "cookie_config.json"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+                saved = config_data.get("cookie", "")
+                if saved:
+                    self.cookie = saved
+                    logger.info("已从数据目录加载Cookie")
+        except (IOError, OSError, json.JSONDecodeError) as e:
+            logger.error(f"加载Cookie失败: {e}")
+
+    async def _save_cookie_to_config(self, cookie_str: str):
+        """将Cookie持久化到数据目录"""
+        try:
+            config_path = self._data_dir / "cookie_config.json"
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config_data = json.load(f)
+            else:
+                config_data = {}
+            config_data["cookie"] = cookie_str
+            os.makedirs(self._data_dir, exist_ok=True)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=4)
+            logger.debug("Cookie已保存到数据目录")
+        except (IOError, OSError, json.JSONDecodeError) as e:
+            logger.error(f"保存Cookie失败: {e}")
     
     async def terminate(self):
         """插件终止"""
         self._running = False
+
+        # 取消所有扫码轮询任务
+        for uid, task in self._login_tasks.items():
+            if not task.done():
+                task.cancel()
+        self._login_tasks.clear()
+
         if self._task and not self._task.done():
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
-                # 任务被取消，正常退出
                 pass
             except Exception:
-                # 捕获其他可能的异常，避免传播
                 logger.exception("终止监控任务时发生异常")
 
-        # 关闭HTTP会话
         if self._http_session and not self._http_session.closed:
             await self._http_session.close()
             logger.debug("HTTP会话已关闭")

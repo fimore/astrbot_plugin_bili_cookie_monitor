@@ -1,6 +1,6 @@
 {
   "cookie": {
-    "description": "B站Cookie字符串（与cookie_file二选一，cookie_file优先级更高）",
+    "description": "B站Cookie字符串（也可通过 /bili_login 扫码登录自动获取）",
     "type": "string",
     "default": ""
   },
@@ -9,29 +9,14 @@
     "type": "int",
     "default": 3600
   },
-  "cookie_file": {
-    "description": "Cookie文件路径（优先级高于cookie，文件名需包含'cookie'）",
-    "type": "string",
-    "default": ""
-  },
   "notify_user_id": {
     "description": "通知用户ID",
     "type": "string",
     "default": ""
   },
-  "admin_whitelist": {
-    "description": "管理员用户ID白名单（列表）",
-    "type": "list",
-    "default": []
-  },
   "notify_cooldown": {
     "description": "通知冷却时间（秒），最小60秒",
     "type": "int",
     "default": 3600
-  },
-  "allowed_cookie_dirs": {
-    "description": "允许读取Cookie文件的目录列表（留空则只允许插件数据目录内的文件）",
-    "type": "list",
-    "default": []
   }
 }

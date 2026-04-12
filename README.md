@@ -7,19 +7,16 @@ AstrBot插件 - 定时检测B站Cookie有效性，失效时主动通知用户
 - 定时检测B站Cookie有效性
 - Cookie失效时主动发送消息通知
 - Cookie恢复时也会通知
-- 支持从文件读取Cookie
+- 支持扫码登录自动获取Cookie
 
 ## 配置
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `cookie` | string | "" | B站Cookie字符串（二选一，`cookie_file`优先级更高） |
-| `cookie_file` | string | "" | Cookie文件路径（优先级高于`cookie`） |
+| `cookie` | string | "" | B站Cookie字符串（也可通过 `/bili_login` 扫码登录自动获取） |
 | `check_interval` | int | 3600 | 检测间隔（秒），最小60秒 |
 | `notify_user_id` | string | "" | 接收通知的用户ID |
-| `admin_whitelist` | array | [] | 管理员用户ID白名单，用于 `/bili_update` 指令 |
 | `notify_cooldown` | int | 3600 | 通知冷却时间（秒），最小60秒 |
-| `allowed_cookie_dirs` | array | [] | 允许读取Cookie文件的目录列表（留空则只允许插件数据目录） |
 
 ## 指令
 
@@ -27,15 +24,7 @@ AstrBot插件 - 定时检测B站Cookie有效性，失效时主动通知用户
 |------|------|------|
 | `/bili_check` | 手动检测Cookie状态 | 所有用户 |
 | `/bili_status` | 查看监控状态 | 所有用户 |
-| `/bili_update <文件路径>` | 更新Cookie文件路径（本次运行有效） | 仅管理员 |
-
-## 安全说明
-
-- Cookie文件路径必须包含"cookie"字样
-- 仅支持 `.txt`、`.json`、`.cookie` 扩展名（必须有扩展名）
-- 默认只允许读取插件数据目录内的文件
-- 可通过 `allowed_cookie_dirs` 配置允许的目录列表
-- 敏感系统路径（如 passwd、shadow 等）会被拒绝访问
+| `/bili_login` | 扫码登录B站，自动获取Cookie | 所有用户 |
 
 ## License
 

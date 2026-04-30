@@ -33,7 +33,7 @@ QR_CODE_EXPIRE_TIME = 180
 POLL_INTERVAL = 5
 
 
-@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件(扫码登录增强版)", "3.0.0", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
+@register("astrbot_plugin_bili_cookie_monitor", "fimore", "B站Cookie状态监控插件(扫码登录增强版)", "3.1.0", "https://github.com/fimore/astrbot_plugin_bili_cookie_monitor")
 class BiliCookieMonitorPlugin(Star):
     """B站Cookie监控插件主类"""
 

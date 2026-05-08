@@ -449,12 +449,12 @@ class BiliCookieMonitorPlugin(Star):
             ) as resp:
                 data = await resp.json()
 
-                # 自动刷新Cookie（捕获Set-Cookie）
-                set_cookie_headers = resp.headers.getall("Set-Cookie", [])
-                if set_cookie_headers:
-                    await self._refresh_cookie_from_headers(set_cookie_headers)
-
                 if data.get("code") == 0 and data.get("data", {}).get("isLogin"):
+                    # Cookie有效时才从响应头刷新
+                    set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+                    if set_cookie_headers:
+                        await self._refresh_cookie_from_headers(set_cookie_headers)
+
                     u = data["data"]
                     return {
                         "valid": True,

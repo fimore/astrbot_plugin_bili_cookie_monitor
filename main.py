@@ -8,10 +8,7 @@ from pathlib import Path
 
 import aiohttp
 import qrcode
-<<<<<<< HEAD
-=======
 from cryptography.fernet import Fernet
->>>>>>> 1a5d055 (feat: v3.0.0 — 扫码登录 + Cookie加密存储，移除文件读取安全风险)
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
@@ -79,9 +76,6 @@ class BiliCookieMonitorPlugin(Star):
         self._data_dir = StarTools.get_data_dir("astrbot_plugin_bili_cookie_monitor")
         self._status_file = self._data_dir / "last_status.json"
         self._key_file = self._data_dir / ".cookie_key"
-
-        # 扫码登录状态：记录当前正在扫码的用户，防止重复扫码
-        self._login_tasks: Dict[str, asyncio.Task] = {}
 
         # 扫码登录状态：记录当前正在扫码的用户，防止重复扫码
         self._login_tasks: Dict[str, asyncio.Task] = {}
@@ -417,9 +411,9 @@ class BiliCookieMonitorPlugin(Star):
                 break
             except Exception:
                 logger.exception("B站Cookie监控出错")
-            finally:
-                if self._running:
-                    await asyncio.sleep(self.check_interval)
+
+            if self._running:
+                await asyncio.sleep(self.check_interval)
 
     def _should_notify(self) -> bool:
         """检查是否应该发送通知（冷却机制）"""
@@ -562,8 +556,6 @@ class BiliCookieMonitorPlugin(Star):
             except (IOError, OSError) as e:
                 logger.error(f"保存状态失败: {e}")
 
-<<<<<<< HEAD
-=======
     def _get_fernet(self) -> Fernet:
         """获取或生成加密密钥"""
         os.makedirs(self._data_dir, exist_ok=True)
@@ -596,7 +588,6 @@ class BiliCookieMonitorPlugin(Star):
             logger.error("Cookie解密失败，密钥可能已变更，请重新扫码登录")
             return ""
 
->>>>>>> 1a5d055 (feat: v3.0.0 — 扫码登录 + Cookie加密存储，移除文件读取安全风险)
     async def _load_cookie_from_data(self):
         """从数据目录加载已保存的Cookie（优先级低于AstrBot配置）"""
         if self.cookie:
@@ -608,26 +599,17 @@ class BiliCookieMonitorPlugin(Star):
                     config_data = json.load(f)
                 saved = config_data.get("cookie", "")
                 if saved:
-<<<<<<< HEAD
-                    self.cookie = saved
-                    logger.info("已从数据目录加载Cookie")
-=======
                     decrypted = self._decrypt_cookie(saved)
                     if decrypted:
                         self.cookie = decrypted
                         logger.info("已从数据目录加载Cookie")
                     else:
                         logger.warning("Cookie解密失败，密钥可能已变更，请重新扫码登录")
->>>>>>> 1a5d055 (feat: v3.0.0 — 扫码登录 + Cookie加密存储，移除文件读取安全风险)
         except (IOError, OSError, json.JSONDecodeError) as e:
             logger.error(f"加载Cookie失败: {e}")
 
     async def _save_cookie_to_config(self, cookie_str: str):
-<<<<<<< HEAD
-        """将Cookie持久化到数据目录"""
-=======
         """将Cookie加密后持久化到数据目录"""
->>>>>>> 1a5d055 (feat: v3.0.0 — 扫码登录 + Cookie加密存储，移除文件读取安全风险)
         try:
             config_path = self._data_dir / "cookie_config.json"
             if config_path.exists():
@@ -635,19 +617,11 @@ class BiliCookieMonitorPlugin(Star):
                     config_data = json.load(f)
             else:
                 config_data = {}
-<<<<<<< HEAD
-            config_data["cookie"] = cookie_str
-            os.makedirs(self._data_dir, exist_ok=True)
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config_data, f, ensure_ascii=False, indent=4)
-            logger.debug("Cookie已保存到数据目录")
-=======
             config_data["cookie"] = self._encrypt_cookie(cookie_str)
             os.makedirs(self._data_dir, exist_ok=True)
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config_data, f, ensure_ascii=False, indent=4)
             logger.debug("Cookie已加密保存到数据目录")
->>>>>>> 1a5d055 (feat: v3.0.0 — 扫码登录 + Cookie加密存储，移除文件读取安全风险)
         except (IOError, OSError, json.JSONDecodeError) as e:
             logger.error(f"保存Cookie失败: {e}")
     
@@ -656,7 +630,7 @@ class BiliCookieMonitorPlugin(Star):
         self._running = False
 
         # 取消所有扫码轮询任务
-        for uid, task in self._login_tasks.items():
+        for uid, task in list(self._login_tasks.items()):
             if not task.done():
                 task.cancel()
         self._login_tasks.clear()
